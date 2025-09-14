@@ -1,12 +1,9 @@
-import functools
 from typing import (
     Any,
     Dict,
     List,
     Optional,
     Sequence,
-    Tuple,
-    Union,
 )
 
 from llama_index.core.base.llms.types import (
@@ -17,7 +14,6 @@ from llama_index.core.base.llms.types import (
     CompletionResponse,
     CompletionResponseAsyncGen,
     CompletionResponseGen,
-    LLMMetadata,
     MessageRole,
     ContentBlock,
     TextBlock,
@@ -92,8 +88,8 @@ from llama_index.llms.openai.utils import to_openai_message_dicts
 class OpenAILikeResponses(OpenAILike):
     """
     OpenAI-like Responses LLM.
-    
-    This class extends OpenAILike to support the OpenAI /responses API for 
+
+    This class extends OpenAILike to support the OpenAI /responses API for
     OpenAI-compatible servers. It combines the flexibility of OpenAILike for
     different API endpoints with the responses-specific functionality.
 
@@ -140,6 +136,7 @@ class OpenAILikeResponses(OpenAILike):
         response = llm.complete("Hi, write a short story")
         print(response.text)
         ```
+
     """
 
     # Response-specific fields
@@ -221,7 +218,7 @@ class OpenAILikeResponses(OpenAILike):
         self.truncation = truncation
         self.user = user
         self.call_metadata = call_metadata
-        
+
         self._previous_response_id = previous_response_id
 
         # store is set to true if track_previous_responses is true
@@ -245,12 +242,12 @@ class OpenAILikeResponses(OpenAILike):
             "store": self.store,
             "temperature": self.temperature,
             "tools": [*initial_tools, *kwargs.pop("tools", [])],
-            "top_p": getattr(self, 'top_p', 1.0),
+            "top_p": getattr(self, "top_p", 1.0),
             "truncation": self.truncation,
             "user": self.user,
         }
 
-        if hasattr(self, 'reasoning_options') and self.reasoning_options is not None:
+        if hasattr(self, "reasoning_options") and self.reasoning_options is not None:
             model_kwargs["reasoning"] = self.reasoning_options
 
         # priority is class args > additional_kwargs > runtime args
@@ -264,12 +261,12 @@ class OpenAILikeResponses(OpenAILike):
     def _parse_response_output(self, output: List[ResponseOutputItem]) -> ChatResponse:
         """Parse response output items into a ChatResponse."""
         import base64
-        
+
         message = ChatMessage(role=MessageRole.ASSISTANT, blocks=[])
         additional_kwargs = {"built_in_tool_calls": []}
         tool_calls = []
         blocks: List[ContentBlock] = []
-        
+
         for item in output:
             if isinstance(item, ResponseOutputMessage):
                 for part in item.content:
@@ -281,20 +278,26 @@ class OpenAILikeResponses(OpenAILike):
                         additional_kwargs["refusal"] = part.refusal
 
                 message.blocks.extend(blocks)
-            elif hasattr(item, 'type') and item.type == 'image_generation':
+            elif hasattr(item, "type") and item.type == "image_generation":
                 # Handle image generation calls
-                if getattr(item, 'status', None) != "failed":
+                if getattr(item, "status", None) != "failed":
                     additional_kwargs["built_in_tool_calls"].append(item)
-                    if hasattr(item, 'result') and item.result is not None:
+                    if hasattr(item, "result") and item.result is not None:
                         image_bytes = base64.b64decode(item.result)
                         blocks.append(ImageBlock(image=image_bytes))
-            elif hasattr(item, 'type') and item.type in ['code_interpreter', 'mcp_call', 'file_search', 'web_search', 'computer_tool']:
+            elif hasattr(item, "type") and item.type in [
+                "code_interpreter",
+                "mcp_call",
+                "file_search",
+                "web_search",
+                "computer_tool",
+            ]:
                 # Handle various built-in tool calls
                 additional_kwargs["built_in_tool_calls"].append(item)
-            elif hasattr(item, 'type') and item.type == 'function_call':
+            elif hasattr(item, "type") and item.type == "function_call":
                 # Handle function tool calls
                 tool_calls.append(item)
-            elif hasattr(item, 'type') and item.type == 'reasoning':
+            elif hasattr(item, "type") and item.type == "reasoning":
                 # Handle reasoning information
                 additional_kwargs["reasoning"] = item
 
@@ -414,29 +417,39 @@ class OpenAILikeResponses(OpenAILike):
     async def acomplete(
         self, prompt: str, formatted: bool = False, **kwargs: Any
     ) -> CompletionResponse:
-        acomplete_fn = lambda p, **kw: self._convert_chat_to_completion_async(
-            self._achat, p, **kw
-        )
+        async def acomplete_fn(p: str, **kw: Any) -> CompletionResponse:
+            return await self._convert_chat_to_completion_async(self._achat, p, **kw)
+
         return await acomplete_fn(prompt, **kwargs)
 
     @llm_completion_callback()
     async def astream_complete(
         self, prompt: str, formatted: bool = False, **kwargs: Any
     ) -> CompletionResponseAsyncGen:
-        astream_complete_fn = lambda p, **kw: self._convert_stream_chat_to_completion_async(
-            self._astream_chat, p, **kw
-        )
+        async def astream_complete_fn(p: str, **kw: Any) -> CompletionResponseAsyncGen:
+            return await self._convert_stream_chat_to_completion_async(
+                self._astream_chat, p, **kw
+            )
+
         return await astream_complete_fn(prompt, **kwargs)
 
     async def _convert_chat_to_completion_async(self, chat_fn, prompt: str, **kwargs):
         """Convert chat function to completion function asynchronously."""
-        from llama_index.core.base.llms.generic_utils import achat_to_completion_decorator
+        from llama_index.core.base.llms.generic_utils import (
+            achat_to_completion_decorator,
+        )
+
         completion_fn = achat_to_completion_decorator(chat_fn)
         return await completion_fn(prompt, **kwargs)
 
-    async def _convert_stream_chat_to_completion_async(self, stream_chat_fn, prompt: str, **kwargs):
+    async def _convert_stream_chat_to_completion_async(
+        self, stream_chat_fn, prompt: str, **kwargs
+    ):
         """Convert stream chat function to stream completion function asynchronously."""
-        from llama_index.core.base.llms.generic_utils import astream_chat_to_completion_decorator
+        from llama_index.core.base.llms.generic_utils import (
+            astream_chat_to_completion_decorator,
+        )
+
         stream_completion_fn = astream_chat_to_completion_decorator(stream_chat_fn)
         return await stream_completion_fn(prompt, **kwargs)
 
@@ -549,7 +562,10 @@ class OpenAILikeResponses(OpenAILike):
     def complete(
         self, prompt: str, formatted: bool = False, **kwargs: Any
     ) -> CompletionResponse:
-        from llama_index.core.base.llms.generic_utils import chat_to_completion_decorator
+        from llama_index.core.base.llms.generic_utils import (
+            chat_to_completion_decorator,
+        )
+
         complete_fn = chat_to_completion_decorator(self._chat)
         return complete_fn(prompt, **kwargs)
 
@@ -557,16 +573,21 @@ class OpenAILikeResponses(OpenAILike):
     def stream_complete(
         self, prompt: str, formatted: bool = False, **kwargs: Any
     ) -> CompletionResponseGen:
-        from llama_index.core.base.llms.generic_utils import stream_chat_to_completion_decorator
+        from llama_index.core.base.llms.generic_utils import (
+            stream_chat_to_completion_decorator,
+        )
+
         stream_complete_fn = stream_chat_to_completion_decorator(self._stream_chat)
         return stream_complete_fn(prompt, **kwargs)
 
     # Inherit tool calling methods from OpenAIResponses
-    def _prepare_chat_with_tools(self, tools, user_msg=None, chat_history=None, **kwargs):
+    def _prepare_chat_with_tools(
+        self, tools, user_msg=None, chat_history=None, **kwargs
+    ):
         """Prepare chat with tools - adapted from OpenAIResponses implementation."""
         from llama_index.core.base.llms.types import ChatMessage, MessageRole
         from llama_index.llms.openai.utils import resolve_tool_choice
-        
+
         # openai responses api has a slightly different tool spec format
         tool_specs = [
             {
@@ -576,7 +597,7 @@ class OpenAILikeResponses(OpenAILike):
             for tool in tools
         ]
 
-        strict = getattr(self, 'strict', False)
+        strict = getattr(self, "strict", False)
 
         if strict:
             for tool_spec in tool_specs:
@@ -590,9 +611,9 @@ class OpenAILikeResponses(OpenAILike):
         if user_msg:
             messages.append(user_msg)
 
-        tool_required = kwargs.get('tool_required', False)
-        tool_choice = kwargs.get('tool_choice', None)
-        allow_parallel_tool_calls = kwargs.get('allow_parallel_tool_calls', True)
+        tool_required = kwargs.get("tool_required", False)
+        tool_choice = kwargs.get("tool_choice")
+        allow_parallel_tool_calls = kwargs.get("allow_parallel_tool_calls", True)
 
         return {
             "messages": messages,
@@ -601,14 +622,21 @@ class OpenAILikeResponses(OpenAILike):
             if tool_specs
             else None,
             "parallel_tool_calls": allow_parallel_tool_calls,
-            **{k: v for k, v in kwargs.items() if k not in ['tool_required', 'tool_choice', 'allow_parallel_tool_calls']},
+            **{
+                k: v
+                for k, v in kwargs.items()
+                if k
+                not in ["tool_required", "tool_choice", "allow_parallel_tool_calls"]
+            },
         }
 
-    def get_tool_calls_from_response(self, response, error_on_no_tool_call=True, **kwargs):
+    def get_tool_calls_from_response(
+        self, response, error_on_no_tool_call=True, **kwargs
+    ):
         """Extract tool calls from response - adapted from OpenAIResponses implementation."""
         from llama_index.core.llms.llm import ToolSelection
         from llama_index.core.llms.utils import parse_partial_json
-        
+
         tool_calls = response.message.additional_kwargs.get("tool_calls", [])
 
         if len(tool_calls) < 1:
