@@ -9,8 +9,8 @@ from llama_index.core.tools import FunctionTool
 def default_openai_like_responses():
     """Create a default OpenAILikeResponses instance with mocked clients."""
     with (
-        patch("llama_index.llms.openai.base.SyncOpenAI"),
-        patch("llama_index.llms.openai.base.AsyncOpenAI"),
+        patch("llama_index.llms.openai.responses.SyncOpenAI"),
+        patch("llama_index.llms.openai.responses.AsyncOpenAI"),
     ):
         return OpenAILikeResponses(
             model="test-model",
@@ -47,11 +47,12 @@ def test_class_name(default_openai_like_responses):
 
 
 def test_get_model_kwargs(default_openai_like_responses):
-    """Test model kwargs generation for responses API."""
+    """Test model kwargs generation for responses API - inherited from parent."""
     llm = default_openai_like_responses
     llm.instructions = "Test instructions"
     llm.user = "test_user"
 
+    # Test that we inherit the _get_model_kwargs from parent class
     kwargs = llm._get_model_kwargs()
 
     assert kwargs["model"] == "test-model"
@@ -63,7 +64,7 @@ def test_get_model_kwargs(default_openai_like_responses):
 
 
 def test_get_model_kwargs_with_tools(default_openai_like_responses):
-    """Test model kwargs with additional tools."""
+    """Test model kwargs with additional tools - inherited from parent."""
     llm = default_openai_like_responses
 
     def test_function(query: str) -> str:
@@ -72,6 +73,7 @@ def test_get_model_kwargs_with_tools(default_openai_like_responses):
     tool = FunctionTool.from_defaults(fn=test_function)
     tool_dict = {"type": "function", "name": "test_function"}
 
+    # Test that we inherit the _get_model_kwargs from parent class  
     kwargs = llm._get_model_kwargs(tools=[tool_dict])
 
     assert len(kwargs["tools"]) >= 1
@@ -81,8 +83,8 @@ def test_get_model_kwargs_with_tools(default_openai_like_responses):
 def test_responses_specific_fields():
     """Test that responses-specific fields are properly set."""
     with (
-        patch("llama_index.llms.openai.base.SyncOpenAI"),
-        patch("llama_index.llms.openai.base.AsyncOpenAI"),
+        patch("llama_index.llms.openai.responses.SyncOpenAI"),
+        patch("llama_index.llms.openai.responses.AsyncOpenAI"),
     ):
         llm = OpenAILikeResponses(
             model="test-model",
@@ -108,8 +110,8 @@ def test_responses_specific_fields():
 def test_track_previous_responses_enables_store():
     """Test that track_previous_responses=True automatically sets store=True."""
     with (
-        patch("llama_index.llms.openai.base.SyncOpenAI"),
-        patch("llama_index.llms.openai.base.AsyncOpenAI"),
+        patch("llama_index.llms.openai.responses.SyncOpenAI"),
+        patch("llama_index.llms.openai.responses.AsyncOpenAI"),
     ):
         llm = OpenAILikeResponses(
             model="test-model",
@@ -128,8 +130,8 @@ if __name__ == "__main__":
     print("Running basic functionality test...")
 
     with (
-        patch("llama_index.llms.openai.base.SyncOpenAI"),
-        patch("llama_index.llms.openai.base.AsyncOpenAI"),
+        patch("llama_index.llms.openai.responses.SyncOpenAI"),
+        patch("llama_index.llms.openai.responses.AsyncOpenAI"),
     ):
         llm = OpenAILikeResponses(
             model="test-model",
