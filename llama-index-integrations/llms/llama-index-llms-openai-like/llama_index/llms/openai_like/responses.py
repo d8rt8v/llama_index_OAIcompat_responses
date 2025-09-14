@@ -1,0 +1,638 @@
+import functools
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
+
+from llama_index.core.base.llms.types import (
+    ChatMessage,
+    ChatResponse,
+    ChatResponseAsyncGen,
+    ChatResponseGen,
+    CompletionResponse,
+    CompletionResponseAsyncGen,
+    CompletionResponseGen,
+    LLMMetadata,
+    MessageRole,
+    ContentBlock,
+    TextBlock,
+    ImageBlock,
+)
+from llama_index.core.bridge.pydantic import Field, PrivateAttr
+from llama_index.core.constants import DEFAULT_TEMPERATURE
+from llama_index.core.llms.callbacks import llm_chat_callback, llm_completion_callback
+from llama_index.llms.openai_like.base import OpenAILike
+from llama_index.llms.openai.responses import (
+    OpenAIResponses,
+    ResponseFunctionToolCall,
+    DEFAULT_OPENAI_MODEL,
+    llm_retry_decorator,
+)
+
+# Import OpenAI responses types
+try:
+    from openai.types.responses import (
+        Response,
+        ResponseStreamEvent,
+        ResponseCompletedEvent,
+        ResponseCreatedEvent,
+        ResponseFileSearchCallCompletedEvent,
+        ResponseFunctionCallArgumentsDeltaEvent,
+        ResponseFunctionCallArgumentsDoneEvent,
+        ResponseInProgressEvent,
+        ResponseOutputItemAddedEvent,
+        ResponseOutputTextAnnotationAddedEvent,
+        ResponseTextDeltaEvent,
+        ResponseWebSearchCallCompletedEvent,
+        ResponseOutputItem,
+        ResponseOutputMessage,
+        ResponseFileSearchToolCall,
+        ResponseFunctionToolCall as OpenAIResponseFunctionToolCall,
+        ResponseFunctionWebSearch,
+        ResponseComputerToolCall,
+        ResponseReasoningItem,
+        ResponseCodeInterpreterToolCall,
+        ResponseImageGenCallPartialImageEvent,
+    )
+    from openai.types.responses.response_output_item import ImageGenerationCall, McpCall
+except ImportError:
+    # Fallback for older OpenAI client versions
+    Response = Any
+    ResponseStreamEvent = Any
+    ResponseCompletedEvent = Any
+    ResponseCreatedEvent = Any
+    ResponseFileSearchCallCompletedEvent = Any
+    ResponseFunctionCallArgumentsDeltaEvent = Any
+    ResponseFunctionCallArgumentsDoneEvent = Any
+    ResponseInProgressEvent = Any
+    ResponseOutputItemAddedEvent = Any
+    ResponseOutputTextAnnotationAddedEvent = Any
+    ResponseTextDeltaEvent = Any
+    ResponseWebSearchCallCompletedEvent = Any
+    ResponseOutputItem = Any
+    ResponseOutputMessage = Any
+    ResponseFileSearchToolCall = Any
+    OpenAIResponseFunctionToolCall = Any
+    ResponseFunctionWebSearch = Any
+    ResponseComputerToolCall = Any
+    ResponseReasoningItem = Any
+    ResponseCodeInterpreterToolCall = Any
+    ResponseImageGenCallPartialImageEvent = Any
+    ImageGenerationCall = Any
+    McpCall = Any
+
+from llama_index.llms.openai.utils import to_openai_message_dicts
+
+
+class OpenAILikeResponses(OpenAILike):
+    """
+    OpenAI-like Responses LLM.
+    
+    This class extends OpenAILike to support the OpenAI /responses API for 
+    OpenAI-compatible servers. It combines the flexibility of OpenAILike for
+    different API endpoints with the responses-specific functionality.
+
+    Args:
+        model: name of the model to use.
+        api_base: The base URL for the API.
+        api_key: API key for authentication.
+        temperature: a float from 0 to 1 controlling randomness in generation.
+        max_output_tokens: the maximum number of tokens to generate.
+        reasoning_options: Optional dictionary to configure reasoning for O1 models.
+        include: Additional output data to include in the model response.
+        instructions: Instructions for the model to follow.
+        track_previous_responses: Whether to track previous responses.
+        store: Whether to store previous responses in OpenAI's storage.
+        built_in_tools: The built-in tools to use for the model to augment responses.
+        truncation: Whether to auto-truncate the input if it exceeds the model's context window.
+        user: An optional identifier to help track the user's requests for abuse.
+        strict: Whether to enforce strict validation of the structured output.
+        context_window: The context window to use for the api.
+        is_chat_model: Whether the model uses the chat or completion endpoint.
+        is_function_calling_model: Whether the model supports OpenAI function calling/tools.
+        additional_kwargs: Add additional parameters to OpenAI request body.
+        max_retries: How many times to retry the API call if it fails.
+        timeout: How long to wait, in seconds, for an API call before failing.
+        default_headers: override the default headers for API requests.
+        http_client: pass in your own httpx.Client instance.
+        async_http_client: pass in your own httpx.AsyncClient instance.
+
+    Examples:
+        `pip install llama-index-llms-openai-like`
+
+        ```python
+        from llama_index.llms.openai_like import OpenAILikeResponses
+
+        llm = OpenAILikeResponses(
+            model="my-model",
+            api_base="https://my-openai-compatible-api.com/v1",
+            api_key="my-api-key",
+            context_window=128000,
+            is_chat_model=True,
+            is_function_calling_model=True,
+        )
+
+        response = llm.complete("Hi, write a short story")
+        print(response.text)
+        ```
+    """
+
+    # Response-specific fields
+    max_output_tokens: Optional[int] = Field(
+        default=None,
+        description="The maximum number of tokens to generate.",
+        gt=0,
+    )
+    reasoning_options: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional dictionary to configure reasoning for O1 models. Example: {'effort': 'low', 'summary': 'concise'}",
+    )
+    include: Optional[List[str]] = Field(
+        default=None,
+        description="Additional output data to include in the model response.",
+    )
+    instructions: Optional[str] = Field(
+        default=None,
+        description="Instructions for the model to follow.",
+    )
+    track_previous_responses: bool = Field(
+        default=False,
+        description="Whether to track previous responses. If true, the LLM class will statefully track previous responses.",
+    )
+    store: bool = Field(
+        default=False,
+        description="Whether to store previous responses in OpenAI's storage.",
+    )
+    built_in_tools: Optional[List[dict]] = Field(
+        default=None,
+        description="The built-in tools to use for the model to augment responses.",
+    )
+    truncation: str = Field(
+        default="disabled",
+        description="Whether to auto-truncate the input if it exceeds the model's context window.",
+    )
+    user: Optional[str] = Field(
+        default=None,
+        description="An optional identifier to help track the user's requests for abuse.",
+    )
+    call_metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Metadata to include in the API call.",
+    )
+
+    _previous_response_id: Optional[str] = PrivateAttr()
+
+    def __init__(
+        self,
+        model: str = DEFAULT_OPENAI_MODEL,
+        temperature: float = DEFAULT_TEMPERATURE,
+        max_output_tokens: Optional[int] = None,
+        reasoning_options: Optional[Dict[str, Any]] = None,
+        include: Optional[List[str]] = None,
+        instructions: Optional[str] = None,
+        track_previous_responses: bool = False,
+        store: bool = False,
+        built_in_tools: Optional[List[dict]] = None,
+        truncation: str = "disabled",
+        user: Optional[str] = None,
+        previous_response_id: Optional[str] = None,
+        call_metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_output_tokens,
+            **kwargs,
+        )
+
+        self.max_output_tokens = max_output_tokens
+        self.reasoning_options = reasoning_options
+        self.include = include
+        self.instructions = instructions
+        self.track_previous_responses = track_previous_responses
+        self.store = store
+        self.built_in_tools = built_in_tools
+        self.truncation = truncation
+        self.user = user
+        self.call_metadata = call_metadata
+        
+        self._previous_response_id = previous_response_id
+
+        # store is set to true if track_previous_responses is true
+        if self.track_previous_responses:
+            self.store = True
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "openai_like_responses_llm"
+
+    def _get_model_kwargs(self, **kwargs: Any) -> Dict[str, Any]:
+        """Get model kwargs for responses API calls."""
+        initial_tools = self.built_in_tools or []
+        model_kwargs = {
+            "model": self.model,
+            "include": self.include,
+            "instructions": self.instructions,
+            "max_output_tokens": self.max_output_tokens,
+            "metadata": self.call_metadata,
+            "previous_response_id": self._previous_response_id,
+            "store": self.store,
+            "temperature": self.temperature,
+            "tools": [*initial_tools, *kwargs.pop("tools", [])],
+            "top_p": getattr(self, 'top_p', 1.0),
+            "truncation": self.truncation,
+            "user": self.user,
+        }
+
+        if hasattr(self, 'reasoning_options') and self.reasoning_options is not None:
+            model_kwargs["reasoning"] = self.reasoning_options
+
+        # priority is class args > additional_kwargs > runtime args
+        model_kwargs.update(self.additional_kwargs)
+
+        kwargs = kwargs or {}
+        model_kwargs.update(kwargs)
+
+        return model_kwargs
+
+    def _parse_response_output(self, output: List[ResponseOutputItem]) -> ChatResponse:
+        """Parse response output items into a ChatResponse."""
+        import base64
+        
+        message = ChatMessage(role=MessageRole.ASSISTANT, blocks=[])
+        additional_kwargs = {"built_in_tool_calls": []}
+        tool_calls = []
+        blocks: List[ContentBlock] = []
+        
+        for item in output:
+            if isinstance(item, ResponseOutputMessage):
+                for part in item.content:
+                    if hasattr(part, "text"):
+                        blocks.append(TextBlock(text=part.text))
+                    if hasattr(part, "annotations"):
+                        additional_kwargs["annotations"] = part.annotations
+                    if hasattr(part, "refusal"):
+                        additional_kwargs["refusal"] = part.refusal
+
+                message.blocks.extend(blocks)
+            elif hasattr(item, 'type') and item.type == 'image_generation':
+                # Handle image generation calls
+                if getattr(item, 'status', None) != "failed":
+                    additional_kwargs["built_in_tool_calls"].append(item)
+                    if hasattr(item, 'result') and item.result is not None:
+                        image_bytes = base64.b64decode(item.result)
+                        blocks.append(ImageBlock(image=image_bytes))
+            elif hasattr(item, 'type') and item.type in ['code_interpreter', 'mcp_call', 'file_search', 'web_search', 'computer_tool']:
+                # Handle various built-in tool calls
+                additional_kwargs["built_in_tool_calls"].append(item)
+            elif hasattr(item, 'type') and item.type == 'function_call':
+                # Handle function tool calls
+                tool_calls.append(item)
+            elif hasattr(item, 'type') and item.type == 'reasoning':
+                # Handle reasoning information
+                additional_kwargs["reasoning"] = item
+
+        if tool_calls and message:
+            message.additional_kwargs["tool_calls"] = tool_calls
+
+        return ChatResponse(message=message, additional_kwargs=additional_kwargs)
+
+    @llm_retry_decorator
+    def _chat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponse:
+        client = self._get_client()
+        message_dicts = to_openai_message_dicts(
+            messages,
+            model=self.model,
+            is_responses_api=True,
+        )
+
+        response: Response = client.responses.create(
+            input=message_dicts,
+            stream=False,
+            **self._get_model_kwargs(**kwargs),
+        )
+
+        if self.track_previous_responses:
+            self._previous_response_id = response.id
+
+        chat_response = self._parse_response_output(response.output)
+        chat_response.raw = response
+        chat_response.additional_kwargs["usage"] = response.usage
+
+        return chat_response
+
+    @llm_retry_decorator
+    def _stream_chat(
+        self, messages: Sequence[ChatMessage], **kwargs: Any
+    ) -> ChatResponseGen:
+        message_dicts = to_openai_message_dicts(
+            messages,
+            model=self.model,
+            is_responses_api=True,
+        )
+
+        def gen() -> ChatResponseGen:
+            tool_calls = []
+            built_in_tool_calls = []
+            additional_kwargs = {"built_in_tool_calls": []}
+            current_tool_call: Optional[ResponseFunctionToolCall] = None
+            local_previous_response_id = self._previous_response_id
+
+            for event in self._get_client().responses.create(
+                input=message_dicts,
+                stream=True,
+                **self._get_model_kwargs(**kwargs),
+            ):
+                # Process the event and update state
+                (
+                    blocks,
+                    tool_calls,
+                    built_in_tool_calls,
+                    additional_kwargs,
+                    current_tool_call,
+                    local_previous_response_id,
+                    delta,
+                ) = OpenAIResponses.process_response_event(
+                    event=event,
+                    tool_calls=tool_calls,
+                    built_in_tool_calls=built_in_tool_calls,
+                    additional_kwargs=additional_kwargs,
+                    current_tool_call=current_tool_call,
+                    track_previous_responses=self.track_previous_responses,
+                    previous_response_id=local_previous_response_id,
+                )
+
+                if (
+                    self.track_previous_responses
+                    and local_previous_response_id != self._previous_response_id
+                ):
+                    self._previous_response_id = local_previous_response_id
+
+                if built_in_tool_calls:
+                    additional_kwargs["built_in_tool_calls"] = built_in_tool_calls
+
+                # For any event, yield a ChatResponse with the current state
+                yield ChatResponse(
+                    message=ChatMessage(
+                        role=MessageRole.ASSISTANT,
+                        blocks=blocks,
+                        additional_kwargs={"tool_calls": tool_calls}
+                        if tool_calls
+                        else {},
+                    ),
+                    delta=delta,
+                    raw=event,
+                    additional_kwargs=additional_kwargs,
+                )
+
+        return gen()
+
+    # ===== Async Endpoints =====
+    @llm_chat_callback()
+    async def achat(
+        self,
+        messages: Sequence[ChatMessage],
+        **kwargs: Any,
+    ) -> ChatResponse:
+        return await self._achat(messages, **kwargs)
+
+    @llm_chat_callback()
+    async def astream_chat(
+        self,
+        messages: Sequence[ChatMessage],
+        **kwargs: Any,
+    ) -> ChatResponseAsyncGen:
+        return await self._astream_chat(messages, **kwargs)
+
+    @llm_completion_callback()
+    async def acomplete(
+        self, prompt: str, formatted: bool = False, **kwargs: Any
+    ) -> CompletionResponse:
+        acomplete_fn = lambda p, **kw: self._convert_chat_to_completion_async(
+            self._achat, p, **kw
+        )
+        return await acomplete_fn(prompt, **kwargs)
+
+    @llm_completion_callback()
+    async def astream_complete(
+        self, prompt: str, formatted: bool = False, **kwargs: Any
+    ) -> CompletionResponseAsyncGen:
+        astream_complete_fn = lambda p, **kw: self._convert_stream_chat_to_completion_async(
+            self._astream_chat, p, **kw
+        )
+        return await astream_complete_fn(prompt, **kwargs)
+
+    async def _convert_chat_to_completion_async(self, chat_fn, prompt: str, **kwargs):
+        """Convert chat function to completion function asynchronously."""
+        from llama_index.core.base.llms.generic_utils import achat_to_completion_decorator
+        completion_fn = achat_to_completion_decorator(chat_fn)
+        return await completion_fn(prompt, **kwargs)
+
+    async def _convert_stream_chat_to_completion_async(self, stream_chat_fn, prompt: str, **kwargs):
+        """Convert stream chat function to stream completion function asynchronously."""
+        from llama_index.core.base.llms.generic_utils import astream_chat_to_completion_decorator
+        stream_completion_fn = astream_chat_to_completion_decorator(stream_chat_fn)
+        return await stream_completion_fn(prompt, **kwargs)
+
+    @llm_retry_decorator
+    async def _achat(
+        self, messages: Sequence[ChatMessage], **kwargs: Any
+    ) -> ChatResponse:
+        aclient = self._get_aclient()
+        message_dicts = to_openai_message_dicts(
+            messages,
+            model=self.model,
+            is_responses_api=True,
+        )
+
+        response: Response = await aclient.responses.create(
+            input=message_dicts,
+            stream=False,
+            **self._get_model_kwargs(**kwargs),
+        )
+
+        if self.track_previous_responses:
+            self._previous_response_id = response.id
+
+        chat_response = self._parse_response_output(response.output)
+        chat_response.raw = response
+        chat_response.additional_kwargs["usage"] = response.usage
+
+        return chat_response
+
+    @llm_retry_decorator
+    async def _astream_chat(
+        self, messages: Sequence[ChatMessage], **kwargs: Any
+    ) -> ChatResponseAsyncGen:
+        message_dicts = to_openai_message_dicts(
+            messages,
+            model=self.model,
+            is_responses_api=True,
+        )
+
+        async def gen() -> ChatResponseAsyncGen:
+            tool_calls = []
+            built_in_tool_calls = []
+            additional_kwargs = {"built_in_tool_calls": []}
+            current_tool_call: Optional[ResponseFunctionToolCall] = None
+            local_previous_response_id = self._previous_response_id
+
+            response_stream = await self._get_aclient().responses.create(
+                input=message_dicts,
+                stream=True,
+                **self._get_model_kwargs(**kwargs),
+            )
+
+            async for event in response_stream:
+                # Process the event and update state
+                (
+                    blocks,
+                    tool_calls,
+                    built_in_tool_calls,
+                    additional_kwargs,
+                    current_tool_call,
+                    local_previous_response_id,
+                    delta,
+                ) = OpenAIResponses.process_response_event(
+                    event=event,
+                    tool_calls=tool_calls,
+                    built_in_tool_calls=built_in_tool_calls,
+                    additional_kwargs=additional_kwargs,
+                    current_tool_call=current_tool_call,
+                    track_previous_responses=self.track_previous_responses,
+                    previous_response_id=local_previous_response_id,
+                )
+
+                if (
+                    self.track_previous_responses
+                    and local_previous_response_id != self._previous_response_id
+                ):
+                    self._previous_response_id = local_previous_response_id
+
+                if built_in_tool_calls:
+                    additional_kwargs["built_in_tool_calls"] = built_in_tool_calls
+
+                # For any event, yield a ChatResponse with the current state
+                yield ChatResponse(
+                    message=ChatMessage(
+                        role=MessageRole.ASSISTANT,
+                        blocks=blocks,
+                        additional_kwargs={"tool_calls": tool_calls}
+                        if tool_calls
+                        else {},
+                    ),
+                    delta=delta,
+                    raw=event,
+                    additional_kwargs=additional_kwargs,
+                )
+
+        return gen()
+
+    # Override chat/complete methods to use responses API
+    @llm_chat_callback()
+    def chat(self, messages: Sequence[ChatMessage], **kwargs: Any) -> ChatResponse:
+        return self._chat(messages, **kwargs)
+
+    @llm_chat_callback()
+    def stream_chat(
+        self, messages: Sequence[ChatMessage], **kwargs: Any
+    ) -> ChatResponseGen:
+        return self._stream_chat(messages, **kwargs)
+
+    @llm_completion_callback()
+    def complete(
+        self, prompt: str, formatted: bool = False, **kwargs: Any
+    ) -> CompletionResponse:
+        from llama_index.core.base.llms.generic_utils import chat_to_completion_decorator
+        complete_fn = chat_to_completion_decorator(self._chat)
+        return complete_fn(prompt, **kwargs)
+
+    @llm_completion_callback()
+    def stream_complete(
+        self, prompt: str, formatted: bool = False, **kwargs: Any
+    ) -> CompletionResponseGen:
+        from llama_index.core.base.llms.generic_utils import stream_chat_to_completion_decorator
+        stream_complete_fn = stream_chat_to_completion_decorator(self._stream_chat)
+        return stream_complete_fn(prompt, **kwargs)
+
+    # Inherit tool calling methods from OpenAIResponses
+    def _prepare_chat_with_tools(self, tools, user_msg=None, chat_history=None, **kwargs):
+        """Prepare chat with tools - adapted from OpenAIResponses implementation."""
+        from llama_index.core.base.llms.types import ChatMessage, MessageRole
+        from llama_index.llms.openai.utils import resolve_tool_choice
+        
+        # openai responses api has a slightly different tool spec format
+        tool_specs = [
+            {
+                "type": "function",
+                **tool.metadata.to_openai_tool(skip_length_check=True)["function"],
+            }
+            for tool in tools
+        ]
+
+        strict = getattr(self, 'strict', False)
+
+        if strict:
+            for tool_spec in tool_specs:
+                tool_spec["strict"] = True
+                tool_spec["parameters"]["additionalProperties"] = False
+
+        if isinstance(user_msg, str):
+            user_msg = ChatMessage(role=MessageRole.USER, content=user_msg)
+
+        messages = chat_history or []
+        if user_msg:
+            messages.append(user_msg)
+
+        tool_required = kwargs.get('tool_required', False)
+        tool_choice = kwargs.get('tool_choice', None)
+        allow_parallel_tool_calls = kwargs.get('allow_parallel_tool_calls', True)
+
+        return {
+            "messages": messages,
+            "tools": tool_specs or None,
+            "tool_choice": resolve_tool_choice(tool_choice, tool_required)
+            if tool_specs
+            else None,
+            "parallel_tool_calls": allow_parallel_tool_calls,
+            **{k: v for k, v in kwargs.items() if k not in ['tool_required', 'tool_choice', 'allow_parallel_tool_calls']},
+        }
+
+    def get_tool_calls_from_response(self, response, error_on_no_tool_call=True, **kwargs):
+        """Extract tool calls from response - adapted from OpenAIResponses implementation."""
+        from llama_index.core.llms.llm import ToolSelection
+        from llama_index.core.llms.utils import parse_partial_json
+        
+        tool_calls = response.message.additional_kwargs.get("tool_calls", [])
+
+        if len(tool_calls) < 1:
+            if error_on_no_tool_call:
+                raise ValueError(
+                    f"Expected at least one tool call, but got {len(tool_calls)} tool calls."
+                )
+            else:
+                return []
+
+        tool_selections = []
+        for tool_call in tool_calls:
+            # this should handle both complete and partial jsons
+            try:
+                argument_dict = parse_partial_json(tool_call.arguments)
+            except ValueError:
+                argument_dict = {}
+
+            tool_selections.append(
+                ToolSelection(
+                    tool_id=tool_call.call_id,
+                    tool_name=tool_call.name,
+                    tool_kwargs=argument_dict,
+                )
+            )
+
+        return tool_selections
