@@ -69,6 +69,46 @@ print(response.text)
 - **Advanced Function Calling**: Enhanced function calling with parallel execution support
 - **Response Storage**: Optional storage of responses in the provider's system
 - **Streaming Support**: Full streaming support for both chat and completion
+- **Structured Output**: Full support for structured output using Pydantic models
+
+### Structured Output with OpenAILikeResponses
+
+The OpenAILikeResponses class supports structured output using Pydantic models:
+
+```python
+from pydantic import BaseModel, Field
+from llama_index.llms.openai_like import OpenAILikeResponses
+
+class PersonInfo(BaseModel):
+    name: str = Field(description="Person's name")
+    age: int = Field(description="Person's age")
+    city: str = Field(description="City where they live")
+    profession: str = Field(description="Their profession")
+
+llm = OpenAILikeResponses(
+    model="gpt-4o-mini",
+    api_base="https://your-api.com/v1", 
+    api_key="your-key",
+    is_chat_model=True,
+)
+
+# Create structured LLM
+structured_llm = llm.as_structured_llm(PersonInfo)
+
+# Get structured response
+response = structured_llm.complete("Tell me about Alice, a 28-year-old engineer in SF")
+
+# Access structured data
+person = response.raw  # PersonInfo object
+print(f"Name: {person.name}, Age: {person.age}")
+print(f"City: {person.city}, Job: {person.profession}")
+```
+
+The structured output implementation automatically:
+- Uses JSON schema-based structured output when supported by the model
+- Falls back to function calling for extraction when JSON schema is not supported
+- Provides full async support for structured output
+- Supports streaming structured output
 
 ### Function Calling with OpenAILikeResponses
 

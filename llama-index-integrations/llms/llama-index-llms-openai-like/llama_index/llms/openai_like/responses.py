@@ -1,9 +1,13 @@
 from typing import (
     Any,
+    AsyncGenerator,
     Dict,
+    Generator,
     List,
     Optional,
     Sequence,
+    Type,
+    Union,
 )
 
 from llama_index.core.base.llms.types import (
@@ -22,6 +26,10 @@ from llama_index.core.base.llms.types import (
 from llama_index.core.bridge.pydantic import Field, PrivateAttr
 from llama_index.core.constants import DEFAULT_TEMPERATURE
 from llama_index.core.llms.callbacks import llm_chat_callback, llm_completion_callback
+from llama_index.core.llms.llm import Model
+from llama_index.core.prompts import PromptTemplate
+from llama_index.core.program.utils import FlexibleModel  
+from llama_index.core.types import PydanticProgramMode
 from llama_index.llms.openai_like.base import OpenAILike
 from llama_index.llms.openai.responses import (
     OpenAIResponses,
@@ -82,16 +90,24 @@ except ImportError:
     ImageGenerationCall = Any
     McpCall = Any
 
-from llama_index.llms.openai.utils import to_openai_message_dicts
+from llama_index.llms.openai.utils import to_openai_message_dicts, is_json_schema_supported
 
 
 class OpenAILikeResponses(OpenAILike):
     """
-    OpenAI-like Responses LLM.
+    OpenAI-like Responses LLM with structured output support.
 
     This class extends OpenAILike to support the OpenAI /responses API for
     OpenAI-compatible servers. It combines the flexibility of OpenAILike for
-    different API endpoints with the responses-specific functionality.
+    different API endpoints with the responses-specific functionality, including
+    full support for structured output via Pydantic models.
+
+    Features:
+    - Support for OpenAI /responses API 
+    - Structured output with Pydantic models
+    - Function calling support
+    - Streaming capabilities
+    - Full async support
 
     Args:
         model: name of the model to use.
@@ -111,6 +127,7 @@ class OpenAILikeResponses(OpenAILike):
         context_window: The context window to use for the api.
         is_chat_model: Whether the model uses the chat or completion endpoint.
         is_function_calling_model: Whether the model supports OpenAI function calling/tools.
+        pydantic_program_mode: Mode for structured output (DEFAULT, OPENAI_JSON, LLM).
         additional_kwargs: Add additional parameters to OpenAI request body.
         max_retries: How many times to retry the API call if it fails.
         timeout: How long to wait, in seconds, for an API call before failing.
@@ -121,6 +138,7 @@ class OpenAILikeResponses(OpenAILike):
     Examples:
         `pip install llama-index-llms-openai-like`
 
+        Basic usage:
         ```python
         from llama_index.llms.openai_like import OpenAILikeResponses
 
@@ -135,6 +153,20 @@ class OpenAILikeResponses(OpenAILike):
 
         response = llm.complete("Hi, write a short story")
         print(response.text)
+        ```
+
+        Structured output with Pydantic models:
+        ```python
+        from pydantic import BaseModel, Field
+
+        class PersonInfo(BaseModel):
+            name: str = Field(description="Person's name")
+            age: int = Field(description="Person's age")
+
+        structured_llm = llm.as_structured_llm(PersonInfo)
+        response = structured_llm.complete("Tell me about Alice, age 25")
+        person_data = response.raw  # PersonInfo object
+        print(f"Name: {person_data.name}, Age: {person_data.age}")
         ```
 
     """
@@ -181,6 +213,10 @@ class OpenAILikeResponses(OpenAILike):
         default=None,
         description="Metadata to include in the API call.",
     )
+    pydantic_program_mode: PydanticProgramMode = Field(
+        default=PydanticProgramMode.DEFAULT,
+        description="Pydantic program mode for structured output.",
+    )
 
     _previous_response_id: Optional[str] = PrivateAttr()
 
@@ -199,6 +235,7 @@ class OpenAILikeResponses(OpenAILike):
         user: Optional[str] = None,
         previous_response_id: Optional[str] = None,
         call_metadata: Optional[Dict[str, Any]] = None,
+        pydantic_program_mode: PydanticProgramMode = PydanticProgramMode.DEFAULT,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -218,6 +255,7 @@ class OpenAILikeResponses(OpenAILike):
         self.truncation = truncation
         self.user = user
         self.call_metadata = call_metadata
+        self.pydantic_program_mode = pydantic_program_mode
 
         self._previous_response_id = previous_response_id
 
@@ -580,7 +618,111 @@ class OpenAILikeResponses(OpenAILike):
         stream_complete_fn = stream_chat_to_completion_decorator(self._stream_chat)
         return stream_complete_fn(prompt, **kwargs)
 
-    # Inherit tool calling methods from OpenAIResponses
+    # ===== Structured Output Methods =====
+    def _should_use_structure_outputs(self) -> bool:
+        """Check if structured output should be used."""
+        return (
+            getattr(self, "pydantic_program_mode", PydanticProgramMode.DEFAULT) == PydanticProgramMode.DEFAULT
+            and is_json_schema_supported(self.model)
+        )
+
+    def _prepare_schema(
+        self, llm_kwargs: Optional[Dict[str, Any]], output_cls: Type[Model]
+    ) -> Dict[str, Any]:
+        """Prepare schema for structured output."""
+        try:
+            from openai.resources.beta.chat.completions import _type_to_response_format
+            response_format = _type_to_response_format(output_cls)
+        except ImportError:
+            # Fallback for older OpenAI client versions or unsupported formats
+            response_format = {"type": "json_object"}
+
+        llm_kwargs = llm_kwargs or {}
+        llm_kwargs["response_format"] = response_format
+        if "tool_choice" in llm_kwargs:
+            del llm_kwargs["tool_choice"]
+        return llm_kwargs
+
+    def structured_predict(
+        self,
+        output_cls: Type[Model],
+        prompt: PromptTemplate,
+        llm_kwargs: Optional[Dict[str, Any]] = None,
+        **prompt_args: Any,
+    ) -> Model:
+        """Structured predict using responses API."""
+        llm_kwargs = llm_kwargs or {}
+
+        if self._should_use_structure_outputs():
+            messages = self._extend_messages(prompt.format_messages(**prompt_args))
+            llm_kwargs = self._prepare_schema(llm_kwargs, output_cls)
+            response = self.chat(messages, **llm_kwargs)
+            return output_cls.model_validate_json(str(response.message.content))
+
+        # Fallback to function calling for structured outputs
+        llm_kwargs["tool_choice"] = (
+            "required" if "tool_choice" not in llm_kwargs else llm_kwargs["tool_choice"]
+        )
+        return super().structured_predict(
+            output_cls, prompt, llm_kwargs=llm_kwargs, **prompt_args
+        )
+
+    async def astructured_predict(
+        self,
+        output_cls: Type[Model],
+        prompt: PromptTemplate,
+        llm_kwargs: Optional[Dict[str, Any]] = None,
+        **prompt_args: Any,
+    ) -> Model:
+        """Async structured predict using responses API."""
+        llm_kwargs = llm_kwargs or {}
+
+        if self._should_use_structure_outputs():
+            messages = self._extend_messages(prompt.format_messages(**prompt_args))
+            llm_kwargs = self._prepare_schema(llm_kwargs, output_cls)
+            response = await self.achat(messages, **llm_kwargs)
+            return output_cls.model_validate_json(str(response.message.content))
+
+        # Fallback to function calling for structured outputs
+        llm_kwargs["tool_choice"] = (
+            "required" if "tool_choice" not in llm_kwargs else llm_kwargs["tool_choice"]
+        )
+        return await super().astructured_predict(
+            output_cls, prompt, llm_kwargs=llm_kwargs, **prompt_args
+        )
+
+    def stream_structured_predict(
+        self,
+        output_cls: Type[Model],
+        prompt: PromptTemplate,
+        llm_kwargs: Optional[Dict[str, Any]] = None,
+        **prompt_args: Any,
+    ) -> Generator[Union[Model, FlexibleModel], None, None]:
+        """Stream structured predict using responses API."""
+        llm_kwargs = llm_kwargs or {}
+
+        return super().stream_structured_predict(
+            output_cls, prompt, llm_kwargs=llm_kwargs, **prompt_args
+        )
+
+    async def astream_structured_predict(
+        self,
+        output_cls: Type[Model],
+        prompt: PromptTemplate,
+        llm_kwargs: Optional[Dict[str, Any]] = None,
+        **prompt_args: Any,
+    ) -> AsyncGenerator[Union[Model, FlexibleModel], None]:
+        """Async stream structured predict using responses API.""" 
+        llm_kwargs = llm_kwargs or {}
+        return await super().astream_structured_predict(
+            output_cls, prompt, llm_kwargs=llm_kwargs, **prompt_args
+        )
+
+    def _extend_messages(self, messages: List[ChatMessage]) -> List[ChatMessage]:
+        """Extend messages with any additional context if needed."""
+        return messages
+
+    # ===== Tool Calling Methods =====
     def _prepare_chat_with_tools(
         self, tools, user_msg=None, chat_history=None, **kwargs
     ):
