@@ -8,6 +8,7 @@ from typing import (
     Sequence,
     Type,
     Union,
+    Callable,
 )
 
 from llama_index.core.base.llms.types import (
@@ -30,13 +31,33 @@ from llama_index.core.llms.llm import Model
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.program.utils import FlexibleModel  
 from llama_index.core.types import PydanticProgramMode
-from llama_index.llms.openai_like.base import OpenAILike
+from llama_index.core.llms.function_calling import FunctionCallingLLM
+from llama_index.core.base.llms.types import LLMMetadata
+from llama_index.core.bridge.pydantic import Field, PrivateAttr
+from llama_index.core.constants import DEFAULT_CONTEXT_WINDOW
 from llama_index.llms.openai.responses import (
     OpenAIResponses,
     ResponseFunctionToolCall,
     DEFAULT_OPENAI_MODEL,
-    llm_retry_decorator,
 )
+
+def llm_retry_decorator(f: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(f)
+    def wrapper(self, *args: Any, **kwargs: Any) -> Any:
+        max_retries = getattr(self, "max_retries", 0)
+        if max_retries <= 0:
+            return f(self, *args, **kwargs)
+
+        retry = create_retry_decorator(
+            max_retries=max_retries,
+            random_exponential=True,
+            stop_after_delay_seconds=60,
+            min_seconds=1,
+            max_seconds=20,
+        )
+        return retry(f)(self, *args, **kwargs)
+
+    return wrapper
 
 # Import OpenAI responses types
 try:
@@ -90,10 +111,24 @@ except ImportError:
     ImageGenerationCall = Any
     McpCall = Any
 
-from llama_index.llms.openai.utils import to_openai_message_dicts, is_json_schema_supported
+from llama_index.llms.openai.utils import (
+    to_openai_message_dicts,
+    is_json_schema_supported,
+    resolve_openai_credentials,
+    resolve_tool_choice,
+    openai_modelname_to_contextsize,
+    is_function_calling_model,
+    create_retry_decorator,
+)
+from llama_index.llms.openai.base import Tokenizer
+import httpx
+import tiktoken
+from openai import AsyncOpenAI
+from openai import OpenAI as SyncOpenAI
+import functools
 
 
-class OpenAILikeResponses(OpenAILike):
+class OpenAILikeResponses(FunctionCallingLLM):
     """
     OpenAI-like Responses LLM with structured output support.
 
@@ -171,6 +206,17 @@ class OpenAILikeResponses(OpenAILike):
 
     """
 
+    # Core LLM fields
+    model: str = Field(
+        default=DEFAULT_OPENAI_MODEL, description="The model name to use."
+    )
+    temperature: float = Field(
+        default=DEFAULT_TEMPERATURE,
+        description="The temperature to use during generation.",
+        ge=0.0,
+        le=2.0,
+    )
+
     # Response-specific fields
     max_output_tokens: Optional[int] = Field(
         default=None,
@@ -213,12 +259,60 @@ class OpenAILikeResponses(OpenAILike):
         default=None,
         description="Metadata to include in the API call.",
     )
+    # OpenAI-like specific fields
+    api_key: Optional[str] = Field(default=None, description="The API key for the service.")
+    api_base: Optional[str] = Field(default=None, description="The base URL for the API.")
+    api_version: Optional[str] = Field(default=None, description="The API version.")
+    context_window: int = Field(
+        default=DEFAULT_CONTEXT_WINDOW,
+        description="The context window to use for the api.",
+    )
+    is_chat_model: bool = Field(
+        default=True,
+        description="Whether the model uses the chat or completion endpoint.",
+    )
+    is_function_calling_model: bool = Field(
+        default=True,
+        description="Whether the model supports OpenAI function calling/tools over the API.",
+    )
+    max_retries: int = Field(
+        default=3,
+        description="The maximum number of API retries.",
+        ge=0,
+    )
+    timeout: float = Field(
+        default=60.0,
+        description="The timeout, in seconds, for API requests.",
+        ge=0,
+    )
+    default_headers: Optional[Dict[str, str]] = Field(
+        default=None, description="The default headers for API requests."
+    )
+    tokenizer: Union[Tokenizer, str, None] = Field(
+        default=None,
+        description=(
+            "An instance of a tokenizer object that has an encode method, or the name"
+            " of a tokenizer model from Hugging Face. If left as None, then this"
+            " disables inference of max_tokens."
+        ),
+    )
+    strict: bool = Field(
+        default=False,
+        description="Whether to enforce strict validation of the structured output.",
+    )
+    additional_kwargs: Dict[str, Any] = Field(
+        default_factory=dict, description="Additional kwargs for the OpenAI API."
+    )
     pydantic_program_mode: PydanticProgramMode = Field(
         default=PydanticProgramMode.DEFAULT,
         description="Pydantic program mode for structured output.",
     )
 
     _previous_response_id: Optional[str] = PrivateAttr()
+    _client: Optional[SyncOpenAI] = PrivateAttr()
+    _aclient: Optional[AsyncOpenAI] = PrivateAttr()
+    _http_client: Optional[httpx.Client] = PrivateAttr()
+    _async_http_client: Optional[httpx.AsyncClient] = PrivateAttr()
 
     def __init__(
         self,
@@ -236,40 +330,145 @@ class OpenAILikeResponses(OpenAILike):
         previous_response_id: Optional[str] = None,
         call_metadata: Optional[Dict[str, Any]] = None,
         pydantic_program_mode: PydanticProgramMode = PydanticProgramMode.DEFAULT,
+        # OpenAI-like specific parameters
+        api_key: Optional[str] = None,
+        api_base: Optional[str] = None,
+        api_version: Optional[str] = None,
+        context_window: int = DEFAULT_CONTEXT_WINDOW,
+        is_chat_model: bool = True,
+        is_function_calling_model: bool = True,
+        max_retries: int = 3,
+        timeout: float = 60.0,
+        default_headers: Optional[Dict[str, str]] = None,
+        tokenizer: Union[Tokenizer, str, None] = None,
+        strict: bool = False,
+        additional_kwargs: Optional[Dict[str, Any]] = None,
+        http_client: Optional[httpx.Client] = None,
+        async_http_client: Optional[httpx.AsyncClient] = None,
+        openai_client: Optional[SyncOpenAI] = None,
+        async_openai_client: Optional[AsyncOpenAI] = None,
         **kwargs: Any,
     ) -> None:
+        additional_kwargs = additional_kwargs or {}
+
+        # Resolve credentials if not provided
+        if api_key is None or api_base is None:
+            resolved_key, resolved_base, resolved_version = resolve_openai_credentials(
+                api_key=api_key, api_base=api_base, api_version=api_version
+            )
+            api_key = api_key or resolved_key
+            api_base = api_base or resolved_base
+            api_version = api_version or resolved_version
+
         super().__init__(
             model=model,
             temperature=temperature,
-            max_tokens=max_output_tokens,
+            max_output_tokens=max_output_tokens,
+            reasoning_options=reasoning_options,
+            include=include,
+            instructions=instructions,
+            track_previous_responses=track_previous_responses,
+            store=store,
+            built_in_tools=built_in_tools,
+            truncation=truncation,
+            user=user,
+            call_metadata=call_metadata,
+            pydantic_program_mode=pydantic_program_mode,
+            api_key=api_key,
+            api_base=api_base,
+            api_version=api_version,
+            context_window=context_window,
+            is_chat_model=is_chat_model,
+            is_function_calling_model=is_function_calling_model,
+            max_retries=max_retries,
+            timeout=timeout,
+            default_headers=default_headers,
+            tokenizer=tokenizer,
+            strict=strict,
+            additional_kwargs=additional_kwargs,
             **kwargs,
         )
 
-        self.max_output_tokens = max_output_tokens
-        self.reasoning_options = reasoning_options
-        self.include = include
-        self.instructions = instructions
-        self.track_previous_responses = track_previous_responses
-        self.store = store
-        self.built_in_tools = built_in_tools
-        self.truncation = truncation
-        self.user = user
-        self.call_metadata = call_metadata
-        self.pydantic_program_mode = pydantic_program_mode
-
         self._previous_response_id = previous_response_id
+        self._http_client = http_client
+        self._async_http_client = async_http_client
 
         # store is set to true if track_previous_responses is true
         if self.track_previous_responses:
             self.store = True
 
+        # Initialize OpenAI clients
+        self._client = openai_client
+        self._aclient = async_openai_client
+
     @classmethod
     def class_name(cls) -> str:
         return "openai_like_responses_llm"
 
+    @property
+    def metadata(self) -> LLMMetadata:
+        return LLMMetadata(
+            context_window=self.context_window,
+            num_output=self.max_output_tokens or -1,
+            is_chat_model=self.is_chat_model,
+            is_function_calling_model=self.is_function_calling_model,
+            model_name=self.model,
+        )
+
+    @property
+    def _tokenizer(self) -> Optional[Tokenizer]:
+        """Get tokenizer for this model."""
+        if isinstance(self.tokenizer, str):
+            try:
+                from transformers import AutoTokenizer
+                return AutoTokenizer.from_pretrained(self.tokenizer)
+            except ImportError:
+                return None
+        return self.tokenizer
+
+    def _get_model_name(self) -> str:
+        """Get the model name."""
+        model_name = self.model
+        if "ft-" in model_name:  # legacy fine-tuning
+            model_name = model_name.split(":")[0]
+        elif model_name.startswith("ft:"):
+            model_name = model_name.split(":")[1]
+        return model_name
+
+    def _get_credential_kwargs(self, is_async: bool = False) -> Dict[str, Any]:
+        """Get credential kwargs for OpenAI client."""
+        return {
+            "api_key": self.api_key,
+            "base_url": self.api_base,
+            "max_retries": self.max_retries,
+            "timeout": self.timeout,
+            "default_headers": self.default_headers,
+            "http_client": self._async_http_client if is_async else self._http_client,
+        }
+
+    def _get_client(self) -> SyncOpenAI:
+        """Get sync OpenAI client."""
+        if self._client is None:
+            self._client = SyncOpenAI(**self._get_credential_kwargs())
+        return self._client
+
+    def _get_aclient(self) -> AsyncOpenAI:
+        """Get async OpenAI client."""
+        if self._aclient is None:
+            self._aclient = AsyncOpenAI(**self._get_credential_kwargs(is_async=True))
+        return self._aclient
+
     def _get_model_kwargs(self, **kwargs: Any) -> Dict[str, Any]:
         """Get model kwargs for responses API calls."""
         initial_tools = self.built_in_tools or []
+        
+        # Responses API specific parameters
+        responses_supported_params = {
+            "model", "include", "instructions", "max_output_tokens", "metadata",
+            "previous_response_id", "store", "temperature", "tools", "top_p",
+            "truncation", "user", "tool_choice", "parallel_tool_calls"
+        }
+        
         model_kwargs = {
             "model": self.model,
             "include": self.include,
@@ -292,7 +491,12 @@ class OpenAILikeResponses(OpenAILike):
         model_kwargs.update(self.additional_kwargs)
 
         kwargs = kwargs or {}
-        model_kwargs.update(kwargs)
+        # Only include supported parameters from kwargs
+        filtered_kwargs = {
+            k: v for k, v in kwargs.items() 
+            if k in responses_supported_params
+        }
+        model_kwargs.update(filtered_kwargs)
 
         return model_kwargs
 
